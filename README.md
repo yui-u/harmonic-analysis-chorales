@@ -1,6 +1,6 @@
 # Unsupervised Harmonic Analysis with Code Quality Templates
 This repository is the implementation of 
-"Unsupervised Learning of Harmonic Analysis Based on Neural HSMM with Code Quality Templates"
+["Unsupervised Learning of Harmonic Analysis Based on Neural HSMM with Code Quality Templates"](http://arxiv.org/abs/2403.04135)
 (Uehara; Accepted at 11th International Conference on New Music Concepts, ICNMC2024).
 
 ## Requirements
