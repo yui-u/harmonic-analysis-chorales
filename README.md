@@ -159,3 +159,19 @@ python run.py \
 This research has been supported by JSPS KAKENHI No. 23K20011.
 Computational resource of AI Bridging Cloud Infrastructure (ABCI) 
 provided by National Institute of Advanced Industrial Science and Technology (AIST) was used. 
+
+## Publications
+Please cite the following paper when using this code:
+
+Yui Uehara, "Unsupervised Learning of Harmonic Analysis Based on Neural HSMM with Code Quality Templates." 
+In Proceedings of the International Conference on New Music Concepts, volume 11, pages 30–53, 2024.
+```
+@InProceedings{uehara2024unsupervised,
+  author       = {Uehara, Yui},
+  title        = {{Unsupervised Learning of Harmonic Analysis Based on Neural HSMM with Code Quality Templates}},
+  booktitle    = {{Proceedings of the International Conference on New Music Concepts}},
+  volume       = {11},
+  year         = {2024},
+  pages        = {30-53},
+}
+```
