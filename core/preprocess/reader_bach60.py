@@ -49,13 +49,10 @@ class Bach60Reader(object):
             _chroma = raw_list['chroma'].copy()
 
         sequence_length = len(raw_list['chroma'])
-        if sequence_length <= self._config.max_sequence_length:
-            _chroma += [
-                PAD_CHROMA for _ in range(self._config.max_sequence_length - sequence_length)]
-        else:
+        if self._config.max_sequence_length < sequence_length:
             _chroma = raw_list['chroma'][:self._config.max_sequence_length]
         instances.append({
-            'observation_chroma': ListInstance(list_instances=_chroma),
+            'x_chroma': ListInstance(list_instances=_chroma, pad_value=0),
             'sequence_length': ValueInstance(sequence_length),
             META_DATA: {
                 'reader_name': self.__class__.__name__,
@@ -69,8 +66,8 @@ class Bach60Reader(object):
             }
         })
 
-    def create_instance(self, logger):
-        data_path = Path('bach60/jsbach_chorals_harmony.data')
+    def create_instance(self, logger, dir_dataset):
+        data_path = Path(dir_dataset) / Path('jsbach_chorals_harmony.data')
         instances = []
         raw_list = {
             'event_number': [],

@@ -152,7 +152,9 @@ class NeuralHSMM(nn.Module):
         self.num_qualities = len(self._quality_templates)
         self.quality_magnification = config.quality_magnification
 
-        self.num_modes = config.num_modes
+        self.register_buffer("_num_modes", torch.tensor(config.num_modes))
+        self._num_modes_train = None
+        self._num_modes_eval = None
         self.num_roots = 12
         self.num_tonics = 12
         self.chroma_dim = 12
@@ -195,6 +197,23 @@ class NeuralHSMM(nn.Module):
 
         # residence
         self.master_residence_logits = nn.Parameter(torch.randn(self.max_residential_time))  # (D,)
+
+    @property
+    def num_modes(self):
+        if self.training:
+            if self._num_modes_train is not None:
+                return self._num_modes_train
+            else:
+                return self._num_modes.item()
+        else:
+            if self._num_modes_eval is not None:
+                return self._num_modes_eval
+            else:
+                return self._num_modes.item()
+
+    @num_modes.setter
+    def num_modes(self, v):
+        self.register_buffer("_num_modes", torch.tensor(v, device=self.device))
 
     def get_mode_embeddings(self):
         hx = torch.zeros([1, self.mode_emb_rnn_size], device=self.device)
@@ -542,7 +561,7 @@ class NeuralHSMM(nn.Module):
         lengths = batch['sequence_length'].long()
         batch_size = lengths.size(0)
         max_length = lengths.max().item()
-        x_chroma = batch['observation_chroma'][:, :max_length].float()  # (B, L, C=12)
+        x_chroma = (0 < batch['x_chroma']).float()  # binarize
 
         # encoder
         x_enc = self.chroma_encoder(x_chroma, lengths)  # (B, C)
@@ -761,6 +780,12 @@ class NeuralHSMM(nn.Module):
             results['qualities'] = qualities
         return results
 
+    def forward_eval_num_modes(self, batch, num_modes_eval, viterbi=False):
+        self._num_modes_eval = num_modes_eval
+        output = self.forward(batch, viterbi=viterbi)
+        self._num_modes_eval = None
+        return output
+
     def get_hsmm_params(self, eps=1e-5):
         org_self_training = self.training
         self.eval()
@@ -810,11 +835,11 @@ class NeuralHSMM(nn.Module):
             for m in range(self.num_modes):
                 transition = root_transition_distribution[m]  # (R+1, R+1)
                 avr_residence = (
-                        torch.arange(1, self.max_residential_time + 1).unsqueeze(0).repeat(self.num_roots + 1, 1) * residence_distribution
+                        torch.arange(1, self.max_residential_time + 1, device=self.device).unsqueeze(0).repeat(self.num_roots + 1, 1) * residence_distribution
                 ).sum(dim=-1)
                 prob_transition = 1.0 / avr_residence
                 prob_residence = 1.0 - prob_transition
-                self_transition = torch.eye(self.num_roots + 1) * prob_residence
+                self_transition = torch.eye(self.num_roots + 1, device=self.device) * prob_residence
                 transition = prob_transition * transition + self_transition
                 L, V = torch.linalg.eig(torch.t(transition))
                 assert abs(L[0] - 1.0) < eps, abs(L[0] - 1.0)

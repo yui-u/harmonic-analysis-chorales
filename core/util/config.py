@@ -38,14 +38,18 @@ class Config(ConfigBase):
 
     @property
     def data_suffix(self):
-        suf = '{}-{}'.format(self.dataset, self.key_preprocessing)
+        suf = '{}-{}-{}'.format(self.dataset, self.key_preprocessing, self.resolution_str)
         if self.dataset in ['bach60']:
             suf += '-cv{}-set{}'.format(self.cv_num_set, self.cv_set_no)
         return suf
 
-    def get_model_filename(self, epoch):
-        return '{}-{}-seed{}-ep{}-{}.model'.format(
-            self.model_suffix.lower(), self.data_suffix.lower(), self.seed, epoch, self.now)
+    def get_model_filename(self, epoch, accepted_num_modes=None):
+        if accepted_num_modes is None:
+            return '{}-{}-seed{}-ep{}-{}.model'.format(
+                self.model_suffix.lower(), self.data_suffix.lower(), self.seed, epoch, self.now)
+        else:
+            return '{}-{}-accm{}-seed{}-ep{}-{}.model'.format(
+                self.model_suffix.lower(), self.data_suffix.lower(), accepted_num_modes, self.seed, epoch, self.now)
 
     @property
     def log_filename(self):
@@ -54,8 +58,9 @@ class Config(ConfigBase):
 
     @property
     def model_suffix(self):
-        suf = '{}-{}-m{}-q{}-shift{}'.format(
+        suf = '{}-{}-m{}-q{}-dnm{}-th{}-cos{}-wu{}-shift{}'.format(
             self.activation_fn, self.metric, self.num_modes, self.quality_magnification,
+            self.dynamic_num_modes, self.acceptance_th, self.cossim_limit, self.warmup_num_modes,
             str(not self.no_shift).lower()
         )
         return suf

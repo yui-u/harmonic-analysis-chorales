@@ -11,24 +11,29 @@ from core.eval.evaluator import Evaluator
 from core.model.model import NeuralHSMM, INVERSION_DICT, PITCH_TO_DEGREE
 from core.postprocess.visualize_hmm import HmmVisualizer
 from core.preprocess.reader_bach60 import Bach60Reader
-from core.preprocess.reader_fourpart_chorale import BachChoraleReader
+from core.preprocess.reader import MxlReader, KEY_DE2EN
 from core.trainer.trainer import Trainer
 from core.util.config import Config
 from core.util.logging import create_logger
 from core.util.util import set_seed
 
+EVAL_RESOLUTION = 0.25  # 16th (Excluding bach60 dataset, which has already been pre-processed.)
+
 
 def add_arguments():
-    parser = argparse.ArgumentParser(prog='run_nhsmm_tonicmodal')
+    parser = argparse.ArgumentParser(prog='run')
     parser.add_argument('--device',
                         type=str,
                         default='cpu',
                         help='`cuda:n` where `n` is an integer, or `cpu`')
     parser.add_argument('--dataset',
                         type=str,
-                        default='bach60',
+                        default='bach-4part-mxl',
                         choices=['bach60', 'bach-4part-mxl'],
                         help='Dataset name')
+    parser.add_argument('--include_bracketed_annotations',
+                        action='store_true',
+                        help='Whether to include bracketed chords in the annotation.')
     parser.add_argument('--dir_instance_output',
                         type=str,
                         default='out',
@@ -41,6 +46,11 @@ def add_arguments():
                         type=int,
                         default=0,
                         help='Cross-validation set number')
+    parser.add_argument('--resolution_str',
+                        type=str,
+                        default='half-beat',
+                        choices=['16th', '8th', 'half-beat', 'beat'],
+                        help='Time resolution for predicting harmonic analysis')
     parser.add_argument('--key_preprocessing',
                         type=str,
                         choices=[KEY_PREPROCESS_NONE, KEY_PREPROCESS_NORMALIZE],
@@ -83,6 +93,21 @@ def add_arguments():
                         type=int,
                         default=2,
                         help='Number of modes')
+    parser.add_argument('--dynamic_num_modes',
+                        action='store_true',
+                        help='Num_modes is not fixed and is determined by learning.')
+    parser.add_argument('--acceptance_th',
+                        type=float,
+                        default=1e-2,
+                        help='Threshold to increase number of modes')
+    parser.add_argument('--cossim_limit',
+                        type=float,
+                        default=0.8,
+                        help='Upper bound on the cosine similarity between a new mode and an already accepted mode.')
+    parser.add_argument('--warmup_num_modes',
+                        type=int,
+                        default=16,
+                        help='Number of warm-up epochs for num_modes optimisation.')
     parser.add_argument('--no_shift',
                         action='store_true',
                         help='Disable root shift')
@@ -285,15 +310,72 @@ def make_hsmm_parameter_graphs(
         )
 
 
-def event_to_segment(choral_id, event_items):
-    event_length = len(event_items)
-    seg_items = [[choral_id, 0, 0, event_items[0]]]
-    for ie in range(1, event_length):
-        if event_items[ie] == seg_items[-1][-1]:
-            seg_items[-1][2] = ie
+def get_labeled_score(config, filename, gold, raw_pred, chordlabel_key='fullchord'):
+    import music21 as m21
+    from music21.stream import Voice
+    from music21.note import Note, Rest
+    from music21.chord import Chord
+    if config.dataset in ['bach-4part-mxl']:
+        bwv = filename.split('bwv')[-1]
+        score = m21.corpus.parse('bwv{}'.format(bwv))
+    else:
+        raise NotImplementedError
+
+    # Remove successions of the same label
+    raw_pred = sorted(raw_pred.items(), key=lambda x:x[0])
+    pred = {raw_pred[0][0]: raw_pred[0][1]}
+    for i in range(1, len(raw_pred)):
+        prev_p = raw_pred[i - 1][1]
+        cur_p = raw_pred[i][1]
+        if 'fullchord' in prev_p and prev_p['fullchord'] is not None:
+            if not ((prev_p['key_name'] == cur_p['key_name']) and (prev_p['fullchord'] == cur_p['fullchord'])):
+                pred[cur_p['time']] = cur_p
         else:
-            seg_items.append([choral_id, ie, ie, event_items[ie]])
-    return seg_items
+            if not ((prev_p['key_name'] == cur_p['key_name']) and (prev_p['rootchord'] == cur_p['rootchord'])):
+                pred[cur_p['time']] = cur_p
+
+    prev_gold_key = None
+    prev_pred_key = None
+    prev_gold_pi = None
+    prev_pred_pi = None
+    gold_remaining = list(gold.keys())
+    pred_remaining = list(pred.keys())
+    for pi in range(len(score.parts))[::-1]:
+        # bass first
+        for measure in score.parts[pi].getElementsByClass('Measure'):
+            m_iter = [v for v in measure.getElementsByClass(Voice)]
+            if bool(measure.elements):
+                m_iter += [measure]
+            for voice in m_iter:
+                for note in [vn for vn in voice.elements if isinstance(vn, Note) or isinstance(vn, Rest) or isinstance(vn, Chord)]:
+                    # gold
+                    gold_label = ''
+                    if voice.offset + note.offset in gold_remaining:
+                        if (prev_gold_pi is None) or prev_gold_pi != pi:
+                            gold_label += 'gold:'
+                            prev_gold_pi = pi
+                        if (prev_gold_key is None) or prev_gold_key != gold[voice.offset + note.offset]['key_name']:
+                            gold_label += '{}:'.format(gold[voice.offset + note.offset]['key_name'])
+                            prev_gold_key = gold[voice.offset + note.offset]['key_name']
+                        gold_label += gold[voice.offset + note.offset][chordlabel_key]
+                        gold_remaining.remove(voice.offset + note.offset)
+                    # pred
+                    pred_label = ''
+                    if voice.offset + note.offset in pred_remaining:
+                        if (prev_pred_pi is None) or prev_pred_pi != pi:
+                            pred_label += 'pred:'
+                            prev_pred_pi = pi
+                        if (prev_pred_key is None) or prev_pred_key != pred[voice.offset + note.offset]['key_name']:
+                            pred_label += '{}:'.format(pred[voice.offset + note.offset]['key_name'])
+                            prev_pred_key = pred[voice.offset + note.offset]['key_name']
+                        pred_label += pred[voice.offset + note.offset][chordlabel_key]
+                        pred_remaining.remove(voice.offset + note.offset)
+                    label = '{}\n{}'.format(gold_label, pred_label)
+                    if label.strip():
+                        note.lyric = label
+        if not(bool(gold_remaining) or bool(pred_remaining)):
+            break
+    return score
 
 
 def run_evaluate_bach60(config, model, instances, logger):
@@ -312,8 +394,7 @@ def run_evaluate_bach60(config, model, instances, logger):
     dict_instances = {}
     for instance in instances:
         choral_id = instance[META_DATA]['choral_id']
-        if choral_id not in dict_instances:
-            dict_instances[choral_id] = {}
+        assert choral_id not in dict_instances
         dict_instances[choral_id] = instance
 
     dict_output = {}
@@ -321,12 +402,10 @@ def run_evaluate_bach60(config, model, instances, logger):
     total_rootchord_accuracy = 0
     total_event_length = 0
     for be in eval_output['output']:
-        for states, residences, qualities, obs, length, metadata in zip(
+        for states, residences, qualities, metadata in zip(
                 be[STATES],
                 be[RESIDENCES],
                 be['qualities'],
-                be['observation_chroma'],
-                be['sequence_length'],
                 be[META_DATA]
         ):
             choral_id = metadata['choral_id']
@@ -372,8 +451,6 @@ def run_evaluate_bach60(config, model, instances, logger):
 
             assert choral_id not in dict_output
             dict_output[choral_id] = {
-                'observation_chroma': obs,
-                'sequence_length': length,
                 STATES: states,
                 RESIDENCES: residences,
                 'key_names': key_names,
@@ -399,83 +476,10 @@ def run_evaluate_bach60(config, model, instances, logger):
     return dict_output
 
 
-def get_labeled_score(riemen, gold, pred, offsets):
-    import music21 as m21
-    from music21.corpus.chorales import ChoraleListRKBWV
-
-    gold_dict = dict([(g[1], g) for g in gold])
-    pred_dict = dict([(p[1], p) for p in pred])
-
-    bwv = ChoraleListRKBWV().byRiemenschneider[riemen]['bwv']
-    score = m21.corpus.parse('bwv{}'.format(bwv))
-    measure_to_offset_id = {}
-    cursol = 0
-    seen_ids = []
-    for mi, measure in enumerate(score.parts[-1].getElementsByClass('Measure')):
-        for note in measure.notes:
-            seen_ids.append(note.id)
-        cursol_start = cursol
-        for o in offsets[cursol_start:]:
-            if (0 < mi) and o < measure.offset:
-                if (mi - 1) not in measure_to_offset_id:
-                    measure_to_offset_id[mi - 1] = []
-                measure_to_offset_id[mi - 1].append(cursol)
-                cursol += 1
-    measure_to_offset_id[mi] = list(range(cursol, len(offsets)))
-
-    prev_gold_key = None
-    prev_pred_key = None
-    for mi, measure in enumerate(score.parts[-1].getElementsByClass('Measure')):
-        for offset in measure_to_offset_id[mi]:
-            if offset in gold_dict:
-                gold_key, gold_label = gold_dict[offset][-1]
-                if prev_gold_key == gold_key:
-                    gold_key_label = ''
-                else:
-                    gold_key_label = '{}: '.format(gold_key)
-                    prev_gold_key = gold_key
-                gold_label = gold_key_label + gold_label
-            else:
-                gold_label = ''
-            if offset in pred_dict:
-                pred_key, pred_label = pred_dict[offset][-1]
-                if prev_pred_key == pred_key:
-                    pred_key_label = ''
-                else:
-                    pred_key_label = '{}: '.format(pred_key)
-                    prev_pred_key = pred_key
-                pred_label = pred_key_label + pred_label
-            else:
-                pred_label = ''
-
-            if bool(gold_label) or bool(pred_label):
-                added = False
-                for note in measure.notes:
-                    if (measure.offset + note.offset) == offsets[offset]:
-                        note.lyric = '{}\n{}'.format(pred_label, gold_label)
-                        added = True
-                        break
-                if not added:
-                    for other_part in score.parts[::-1][1:]:
-                        if added:
-                            break
-                        # search other parts
-                        for note in other_part.getElementsByClass('Measure')[mi]:
-                            if (measure.offset + note.offset) == offsets[offset]:
-                                note.lyric = '{}\n{}'.format(pred_label, gold_label)
-                                added = True
-                                break
-    return score
-
-
-def run_evaluate_bach_4part(config, model, instances, logger, output_dir):
-    import json
-    with open('human_annotation_music21/bach_chorale_annotation_m21.json', 'r') as f:
-        bach_choral_annotation_m21 = json.load(f)
+def run_evaluate(config, model, model_filename, instances, logger, output_dir):
     output_dir = output_dir / Path('score_labeled')
     if not output_dir.is_dir():
         output_dir.mkdir()
-
     if config.pivot_chord_selection == 'first':
         sub_record_id = 0
     elif config.pivot_chord_selection == 'last':
@@ -483,69 +487,108 @@ def run_evaluate_bach_4part(config, model, instances, logger, output_dir):
     else:
         raise NotImplementedError
 
-    eval_output = Evaluator.evaluate(
-        instances, model, config, logger, viterbi_output=True, metadata_output=True)
-    params = model.get_hsmm_params()
-    tonic_ids = params['tonic_ids']
-    tonic_qualities = params['tonic_qualities']
-
     name_to_pc = {}
     for pc, names in enumerate(PITCH_NAME_LABELS):
         names = [n.replace(')', '') for n in names.split('(')]
         for name in names:
             name_to_pc[name] = pc
 
-    dict_instances = {}
-    for instance in instances:
-        if 'choral_id' in instance[META_DATA]:
-            choral_id = instance[META_DATA]['choral_id']
-        elif 'riemenschneider' in instance[META_DATA]:
-            choral_id = instance[META_DATA]['riemenschneider']
-        else:
-            raise NotImplementedError
-        if choral_id not in dict_instances:
-            dict_instances[choral_id] = {}
-        if 'section_id' in instance[META_DATA]:
-            section_id = int(instance[META_DATA]['section_id'])
-        else:
-            section_id = 0
-        assert section_id not in dict_instances[choral_id]
-        dict_instances[choral_id][section_id] = instance
+    if 'bach-4part' in config.dataset:
+        import json
+        with open('human_annotation_music21/bach_chorale_annotation_m21.json', 'r') as f:
+            bach_choral_annotation_m21 = json.load(f)
 
-    dict_golds = {}
-    for choral_id in bach_choral_annotation_m21.keys():
-        if int(choral_id) in dict_instances:
-            min_duration = dict_instances[int(choral_id)][0][META_DATA]['min_duration']
-            annotation = bach_choral_annotation_m21[choral_id]['annotation']
-            ann_key_sig = bach_choral_annotation_m21[choral_id]['key_sigs']
-            ann_time_sig = bach_choral_annotation_m21[choral_id]['time-signature']
-            if ann_time_sig in ['3/4', '4/4']:
-                beat_positions = [str(1.0 + b * min_duration) for b in range(int(float(ann_time_sig[0]) / min_duration))]
-            else:
-                raise NotImplementedError
-            prev_record = None
-            gold_key_names = []
-            gold_fullchord_labels = []
-            gold_rootchord_labels = []
-            gold_qualities = []
-            gold_metrics = []
-            metric = 0.0
-            for measure in annotation.keys():
-                if measure == '0':
-                    start_beat = list(annotation['0'].keys())[0]
-                    start_beat_id = beat_positions.index(start_beat)
+    eval_output = Evaluator.evaluate(
+        instances, model, config, logger, viterbi_output=True, metadata_output=True)
+    params = model.get_hsmm_params()
+    tonic_ids = params['tonic_ids']
+    tonic_qualities = params['tonic_qualities']
+
+    # gather instances
+    if 'seg_index' in instances[0][META_DATA]:
+        temp_gathered_instances = {}
+        for instance in instances:
+            fn = instance[META_DATA]['filename']
+            num_segments = instance[META_DATA]['num_segments']
+            timestep = instance[META_DATA]['timestep']
+            seg_index = instance[META_DATA]['seg_index']
+            metadata = dict([(k, v) for k, v in instance[META_DATA].items() if k not in ['seg_index', 'timestep']])
+            if fn not in temp_gathered_instances:
+                temp_gathered_instances[fn] = {
+                    META_DATA: metadata,
+                    'timestep': [None] * num_segments,
+                    'sequence_length': 0,
+                    'x_chroma': [None] * num_segments,
+                    'x_bass': [None] * num_segments
+                }
+            temp_gathered_instances[fn]['timestep'][seg_index] = timestep
+            temp_gathered_instances[fn]['sequence_length'] += instance['sequence_length'].to_tensor().item()
+            temp_gathered_instances[fn]['x_chroma'][seg_index] = instance['x_chroma'].to_tensor().tolist()
+            temp_gathered_instances[fn]['x_bass'][seg_index] = instance['x_bass'].to_tensor().tolist()
+
+        gathered_instances = {}
+        for fn in temp_gathered_instances:
+            timestep = []
+            x_chroma = []
+            x_bass = []
+            for seg_index in range(temp_gathered_instances[fn][META_DATA]['num_segments']):
+                timestep.extend(temp_gathered_instances[fn]['timestep'][seg_index])
+                x_chroma.extend(temp_gathered_instances[fn]['x_chroma'][seg_index])
+                x_bass.extend(temp_gathered_instances[fn]['x_bass'][seg_index])
+            gathered_instances[fn] = {
+                META_DATA: temp_gathered_instances[fn][META_DATA],
+                'timestep': timestep,
+                'sequence_length': temp_gathered_instances[fn]['sequence_length'],
+                'x_chroma': x_chroma,
+                'x_bass': x_bass
+            }
+    else:
+        gathered_instances = {}
+        for instance in instances:
+            gathered_instances[instance[META_DATA]['filename']] = {
+                META_DATA: instance[META_DATA],
+                'timestep': instance[META_DATA]['timestep'].copy(),
+                'sequence_length': instance['sequence_length'].to_tensor().item(),
+                'x_chroma': instance['x_chroma'].to_tensor().tolist(),
+                'x_bass': instance['x_bass'].to_tensor().tolist()
+            }
+
+    # gather annotations
+    golds = {}
+    for instance in gathered_instances.values():
+        fn = instance[META_DATA]['filename']
+        # parse annotation
+        ann = {}
+        prev_offset = None
+        if config.dataset == 'bach-4part-mxl':
+            riemen = fn.split('-')[0][len('riemen'):]
+            if not (set(bach_choral_annotation_m21[riemen]['key_sigs']) == set(
+                [_ for _ in instance[META_DATA]['key_sigs'].split(',') if bool(_)])):
+                logger.info('{}: Skip evaluation due to inconsistent key signatures. annotation:{}, source:{}'.format(
+                    riemen,
+                    set(bach_choral_annotation_m21[riemen]['key_sigs']),
+                    set(instance[META_DATA]['key_sigs'].split(','))))
+                continue
+            measure2offset = {}
+            for v in instance[META_DATA]['offset2mn'].values():
+                if v['m_number'] in measure2offset:
+                    assert (0.0 < v['m_paddingLeft']) or (v['m_offset'] == measure2offset[v['m_number']]['m_offset']), (
+                    measure2offset, v)
                 else:
-                    start_beat_id = 0
-                for beat in beat_positions[start_beat_id:]:
-                    if beat in annotation[measure].keys():
-                        prev_record = annotation[measure][beat][sub_record_id]
-                    gold_metrics.append(metric)
-                    gold_key_names.append(prev_record[0].replace('-', 'b'))
-                    fullchord_label = prev_record[1].split('[')[0]  # remove comment
+                    measure2offset[v['m_number']] = {'m_offset': v['m_offset'], 'm_paddingLeft': v['m_paddingLeft']}
+            for measure, m_ann in bach_choral_annotation_m21[riemen]['annotation'].items():
+                measure = int(measure)
+                for beat, mb_ann in m_ann.items():
+                    offset = measure2offset[measure]['m_offset'] + (
+                                float(beat) - measure2offset[measure]['m_paddingLeft'] - 1.0)
+                    if bool(ann):
+                        assert prev_offset < offset, (measure, beat, mb_ann)
+                    key_name, fullchord_label = mb_ann[sub_record_id]
+                    key_name = key_name.replace('-', 'b')
+                    fullchord_label = fullchord_label.split('[')[0]  # remove comment
                     # Dealing with mixed vii/o7 in viio7 in annotations
                     fullchord_label = fullchord_label.replace('/o', 'o')
-                    gold_fullchord_labels.append(fullchord_label)
-                    fcll = prev_record[1].lower()
+                    fcll = fullchord_label.lower()
                     if fcll.startswith('iii') or fcll.startswith('vii'):
                         rc, quality = fullchord_label[:3], fullchord_label[3:]
                     elif fcll.startswith('ii') or fcll.startswith('iv') or fcll.startswith('vi'):
@@ -557,209 +600,257 @@ def run_evaluate_bach_4part(config, model, instances, logger, output_dir):
                         rc, quality = fullchord_label[:4], fullchord_label[4:]
                     else:
                         raise NotImplementedError
-                    # slash root
+                        # slash root
                     quality_splits = quality.split('/')
                     if ('/' in quality) and (not quality_splits[-1].isdecimal()):
                         slash_root = '/{}'.format(quality[-(len(quality_splits[-1])):])
                         rc += slash_root
                         quality = quality[:-(len(quality_splits[-1]) + 1)]
-                    gold_rootchord_labels.append(rc)
-                    gold_qualities.append(quality)
-                    metric += min_duration
-            assert int(choral_id) not in dict_golds
-            dict_golds[int(choral_id)] = {
-                'key_names': gold_key_names,
-                'fullchord_labels': gold_fullchord_labels,
-                'rootchord_labels': gold_rootchord_labels,
-                'qualities': gold_qualities,
-                'metrics': gold_metrics,
-                'key_sigs': ann_key_sig,
-                'time_sig': ann_time_sig
+                    ann[offset] = {
+                        'time': offset,
+                        'measure': measure,
+                        'beat': beat,
+                        'key_name': key_name,
+                        'fullchord': fullchord_label,
+                        'rootchord': rc,
+                        'quality': quality
+                    }
+                    prev_offset = offset
+        else:
+            raise NotImplementedError
+        assert fn not in golds
+        golds[fn] = ann
+
+    # gather outputs
+    if 'seg_index' in eval_output['output'][0][META_DATA][0]:
+        temp_gathered_outputs = {}
+        for be in eval_output['output']:
+            for states, residences, qualities, raw_metadata in zip(
+                    be[STATES],
+                    be[RESIDENCES],
+                    be['qualities'],
+                    be[META_DATA]
+            ):
+                fn = raw_metadata['filename']
+                num_segments = raw_metadata['num_segments']
+                timestep = raw_metadata['timestep']
+                seg_index = raw_metadata['seg_index']
+                metadata = dict([(k, v) for k, v in raw_metadata.items() if k not in ['seg_index', 'timestep']])
+                if fn not in temp_gathered_outputs:
+                    temp_gathered_outputs[fn] = {
+                        META_DATA: metadata,
+                        'timestep': [None] * num_segments,
+                        'states': [None] * num_segments,
+                        'residences': [None] * num_segments,
+                        'qualities': [None] * num_segments
+                    }
+                temp_gathered_outputs[fn]['timestep'][seg_index] = timestep
+                temp_gathered_outputs[fn]['states'][seg_index] = states
+                temp_gathered_outputs[fn]['residences'][seg_index] = residences
+                temp_gathered_outputs[fn]['qualities'][seg_index] = qualities
+        gathered_outputs = {}
+        for fn in temp_gathered_outputs:
+            timestep = []
+            states = []
+            residences = []
+            qualities = []
+            for seg_index in range(temp_gathered_outputs[fn][META_DATA]['num_segments']):
+                timestep.extend(temp_gathered_outputs[fn]['timestep'][seg_index])
+                states.extend(temp_gathered_outputs[fn]['states'][seg_index])
+                residences.extend(temp_gathered_outputs[fn]['residences'][seg_index])
+                qualities.extend(temp_gathered_outputs[fn]['qualities'][seg_index])
+            gathered_outputs[fn] = {
+                META_DATA: temp_gathered_outputs[fn][META_DATA],
+                'timestep': timestep,
+                'states': states,
+                'residences': residences,
+                'qualities': qualities
             }
+    else:
+        gathered_outputs = {}
+        for be in eval_output['output']:
+            for states, residences, qualities, raw_metadata in zip(
+                    be[STATES],
+                    be[RESIDENCES],
+                    be['qualities'],
+                    be[META_DATA]
+            ):
+                metadata = dict([(k, v) for k, v in raw_metadata.items() if k not in ['seg_index', 'timestep']])
+                gathered_outputs[metadata['filename']] = {
+                    META_DATA: metadata,
+                    'states': states,
+                    'residences': residences,
+                    'qualities': qualities
+                }
 
-    dict_section_output = {}
-    for be in eval_output['output']:
-        for states, residences, qualities, obs, length, metadata in zip(
-                be[STATES],
-                be[RESIDENCES],
-                be['qualities'],
-                be['observation_chroma'],
-                be['sequence_length'],
-                be[META_DATA]
-        ):
-            choral_id = metadata['riemenschneider']
-            section_id = int(metadata['section_id'])
-            bass_pcs = metadata['bass']
-            key_sigs = [ks.name for ks in metadata['key_sigs']]
-            metadata['key_sigs'] = key_sigs
-
-            key_ids = [int(s / 13) for s in states]
-            root_pcs = [s % 13 for s in states]
-            key_names = []
-            pred_fullchord_labels = []
-            pred_rootchord_labels = []
-            for t, (ki, rpc, quality) in enumerate(zip(key_ids, root_pcs, qualities)):
-                mode = int(ki / 12)
-                key_shift = ki % 12
-                key_pc = ((tonic_ids[mode] + key_shift) % 12).item()
-                key_name = PITCH_NAME_LABELS_PRIOR_DICT[tonic_qualities[mode]][key_pc]
-                if '(' in key_name and bool(key_sigs):
-                    if '#' in key_sigs[0]:
-                        key_name = key_name.split('(')[0]
-                    else:
-                        assert '-' in key_sigs[0], key_sigs
-                        key_name = key_name.split('(')[1][:-1]
-                if tonic_qualities[mode] in ['m', 'd']:
-                    key_name = key_name.lower()
-                key_names.append(key_name)
+    # gather prediction
+    predictions = {}
+    for fn, output in gathered_outputs.items():
+        assert fn not in predictions
+        timestep = gathered_instances[fn]['timestep']
+        states = output['states']
+        qualities = output['qualities']
+        bass_midis = gathered_instances[fn]['x_bass']
+        assert (gathered_instances[fn]['sequence_length'] ==
+                len(gathered_instances[fn]['x_chroma']) ==
+                len(timestep) ==
+                len(states) ==
+                len(bass_midis) ==
+                len(qualities))
+        predictions[fn] = {}
+        key_ids = [int(s / 13) for s in states]
+        root_pcs = [s % 13 for s in states]
+        bass_pcs = [int(bm) % 12 if 0 <= bm else REST_INDEX for bm in bass_midis]
+        for t, ki, rpc, quality, bass in zip(timestep, key_ids, root_pcs, qualities, bass_pcs):
+            assert t not in predictions[fn]
+            mode = int(ki / 12)
+            key_shift = ki % 12
+            key_pc = ((tonic_ids[mode] + key_shift) % 12).item()
+            key_name = PITCH_NAME_LABELS_PRIOR_DICT[tonic_qualities[mode]][key_pc]
+            if tonic_qualities[mode] in ['m', 'd']:
+                key_name = key_name.lower()
+            if quality == 'Rest':
+                predictions[fn][t] = {
+                    'time': t,
+                    'key_name': key_name,
+                    'fullchord': 'Rest',
+                    'rootchord': 'Rest',
+                    'quality': quality
+                }
+            else:
                 root_relative_pc = (rpc - key_pc) % 12
-                bass_relative_pc = (bass_pcs[t] - key_pc) % 12
+                bass_relative_pc = (bass - key_pc) % 12
                 sub_root_bass = (root_relative_pc - bass_relative_pc) % 12
-                degree = PITCH_TO_DEGREE[root_relative_pc]
-                if quality == 'Rest':
-                    pred_fullchord_labels.append('Rest')
-                    pred_rootchord_labels.append('Rest')
+                degree = PITCH_TO_DEGREE[root_relative_pc].lower()
+                if quality == '7' or 'M' in quality:
+                    degree = degree.upper()
+                sub_quality = 'o' if 'd' in quality else None
+                is_seventh = True if '7' in quality else False
+                if (bass != REST_INDEX) and (sub_root_bass in INVERSION_DICT[quality]):
+                    quality = INVERSION_DICT[quality][sub_root_bass]
+                    if sub_quality is not None:
+                        quality = sub_quality + quality
+                elif is_seventh:  # seventh base chord
+                    quality = '7'
+                    if sub_quality is not None:
+                        quality = sub_quality + quality
                 else:
-                    if quality == '7' or 'M' in quality:
-                        degree = degree.upper()
-                    sub_quality = 'o' if 'd' in quality else None
-                    is_seventh = True if '7' in quality else False
-                    if sub_root_bass in INVERSION_DICT[quality]:
-                        quality = INVERSION_DICT[quality][sub_root_bass]
-                        if sub_quality is not None:
-                            quality = sub_quality + quality
-                        pred_fullchord_labels.append('{}{}'.format(degree, quality))
-                    elif is_seventh:  # seventh base chord
-                        quality = '7'
-                        if sub_quality is not None:
-                            quality = sub_quality + quality
-                        pred_fullchord_labels.append('{}{}'.format(degree, quality))
-                    else:
-                        quality = None
-                        pred_fullchord_labels.append(degree)
-                    pred_rootchord_labels.append(degree)
+                    quality = ''
+                fullchord = '{}{}'.format(degree, quality)
+                predictions[fn][t] = {
+                    'time': t,
+                    'key_name': key_name,
+                    'fullchord': fullchord,
+                    'rootchord': degree,
+                    'quality': quality
+                }
 
-            if choral_id not in dict_section_output:
-                dict_section_output[choral_id] = {}
-            assert section_id not in dict_section_output[choral_id]
-            dict_section_output[choral_id][section_id] = {
-                'observation_chroma': obs,
-                'sequence_length': length,
-                STATES: states,
-                RESIDENCES: residences,
-                'key_names': key_names,
-                'root_pitch_classes': root_pcs,
-                'pred_fullchord_labels': pred_fullchord_labels,
-                'pred_rootchord_labels': pred_rootchord_labels,
-                'qualities': qualities,
-                META_DATA: metadata
-            }
-
-    test_riemens = sorted(list(dict_golds.keys()))
-    dict_output = {}
-    total_event_key_accuracy = 0
-    total_event_fullchord_accuracy = 0
-    total_event_rootchord_accuracy = 0
-    total_event_fullanalysis_accuracy = 0
-
+    # accuracy
+    accuracy_scores = {}
     total_event_length = 0
-    for riemen in test_riemens:
-        # gather sections
-        assert riemen not in dict_output
-        dict_output[riemen] = {}
-        pred_fullchord_labels = []
-        pred_rootchord_labels = []
-        pred_fullanalysis_labels = []
-        pred_key_names = []
-        pred_metrics = []
-        obs_pitches = []
-        for section_id in sorted(list(dict_section_output[riemen].keys())):
-            section_item = dict_section_output[riemen][section_id]
-            pred_fullchord_labels.extend(section_item['pred_fullchord_labels'])
-            pred_rootchord_labels.extend(section_item['pred_rootchord_labels'])
-            pred_fullanalysis_labels.extend([(k, fc) for k, fc in zip(section_item['key_names'], section_item['pred_fullchord_labels'])])
-            pred_key_names.extend(section_item['key_names'])
-            pred_metrics.extend(section_item[META_DATA]['metrics'])
-            section_length = len(section_item[META_DATA]['metrics'])
-            for obs in section_item['observation_chroma'].tolist()[:section_length]:
-                obs_pitches.append(tuple([io for (io, o) in enumerate(obs) if 0 < o]))
-        dict_output[riemen]['key_names'] = pred_key_names
-        dict_output[riemen]['fullchord_labels'] = pred_fullchord_labels
-        dict_output[riemen]['rootchord_labels'] = pred_rootchord_labels
-        dict_output[riemen]['metrics'] = pred_metrics
-        dict_output[riemen]['observation_pitchClasses'] = obs_pitches
-        # The parsing of gold_data does not take into account the length of the last measure
-        # (which may be shorter in the case of an auftakt), so it may be a little longer than pred.
-        assert len(pred_metrics) <= len(dict_golds[riemen]['metrics']), (len(dict_golds[riemen]['metrics']), len(pred_metrics))
-        for k in ['metrics', 'key_names', 'fullchord_labels', 'rootchord_labels', 'qualities']:
-            dict_golds[riemen][k] = dict_golds[riemen][k][:len(pred_metrics)]
-        dict_golds[riemen]['fullanalysis_labels'] = [(k, fc) for k, fc in zip(dict_golds[riemen]['key_names'], dict_golds[riemen]['fullchord_labels'])]
-        event_length = len(pred_metrics)
+    total_key_accuracy = 0
+    total_fullchord_accuracy = 0
+    total_rootchord_accuracy = 0
+    total_fullanalysis_accuracy = 0
+    total_rootanaylsis_accuracy = 0
+    for fn in golds.keys():
+        gold = list(golds[fn].values())
+        pred = list(predictions[fn].values())
+        timestep = gathered_instances[fn]['timestep']
+        resolution = gathered_instances[fn][META_DATA]['resolution']
+        end_time = timestep[-1] + resolution
+        eval_timestep_length = int((end_time / EVAL_RESOLUTION) + 0.5)
+        gi = -1
+        pi = -1
+        piece_event_length = 0
+        piece_key_accuracy = 0
+        piece_fullchord_accuracy = 0
+        piece_rootchord_accuracy = 0
+        piece_fullanalysis_accuracy = 0
+        piece_rootanaylsis_accuracy = 0
+        for it in range(eval_timestep_length):
+            t = it * EVAL_RESOLUTION
+            if (gi < len(gold) - 1) and (gold[gi + 1]['time'] <= t):
+                gi += 1
+            if (pi < len(pred) - 1) and (pred[pi + 1]['time'] <= t):
+                pi += 1
+            assert 0 <= pi
+            if 0 <= gi:
+                # gold annotation may not start at time 0.0
+                piece_event_length += 1
+                if gold[gi]['key_name'] == pred[pi]['key_name']:
+                    piece_key_accuracy += 1
+                if gold[gi]['rootchord'] == pred[pi]['rootchord']:
+                    piece_rootchord_accuracy += 1
+                if (gold[gi]['key_name'] == pred[pi]['key_name']) and (gold[gi]['rootchord'] == pred[pi]['rootchord']):
+                    piece_rootanaylsis_accuracy += 1
+                if config.dataset in ['bach-4part-mxl']:
+                    if gold[gi]['fullchord'] == pred[pi]['fullchord']:
+                        piece_fullchord_accuracy += 1
+                    if (gold[gi]['key_name'] == pred[pi]['key_name']) and (gold[gi]['fullchord'] == pred[pi]['fullchord']):
+                        piece_fullanalysis_accuracy += 1
+        total_event_length += piece_event_length
+        total_key_accuracy += piece_key_accuracy
+        total_fullchord_accuracy += piece_fullchord_accuracy
+        total_rootchord_accuracy += piece_rootchord_accuracy
+        total_fullanalysis_accuracy += piece_fullanalysis_accuracy
+        total_rootanaylsis_accuracy += piece_rootanaylsis_accuracy
+        # piece accuracy
+        accuracy_scores[fn] = {
+            'key_accuracy': piece_key_accuracy / float(piece_event_length),
+            'rootchord_accuracy': piece_rootchord_accuracy / float(piece_event_length),
+            'rootanalysis_accuracy': piece_rootanaylsis_accuracy / float(piece_event_length)
+        }
+        logger.info('--- {} ---'.format(fn))
+        logger.info('key_accuracy: {}'.format(accuracy_scores[fn]['key_accuracy']))
+        logger.info('rootchord_accuracy: {}'.format(accuracy_scores[fn]['rootchord_accuracy']))
+        logger.info('rootanalysis_accuracy: {}'.format(accuracy_scores[fn]['rootanalysis_accuracy']))
+        if config.dataset in ['bach-4part-mxl']:
+            accuracy_scores[fn]['fullchord_accuracy'] = piece_fullchord_accuracy / float(piece_event_length)
+            accuracy_scores[fn]['fullanalysis_accuracy'] = piece_fullanalysis_accuracy / float(piece_event_length)
+            logger.info('fullchord_accuracy: {}'.format(accuracy_scores[fn]['fullchord_accuracy']))
+            logger.info('fullanalysis_accuracy: {}'.format(accuracy_scores[fn]['fullanalysis_accuracy']))
+        # score
+        if config.dataset in ['bach-4part-mxl']:
+            labeled_score = get_labeled_score(config, fn, golds[fn], predictions[fn], chordlabel_key='fullchord')
+        else:
+            raise NotImplementedError
+        labeled_score.write(
+            'musicxml',
+            str(output_dir / Path('{}-{}.mxl'.format(Path(fn).stem, model_filename))))
 
-        if set(dict_golds[riemen]['key_sigs']) == set(dict_section_output[riemen][0][META_DATA]['key_sigs']):
-            # event level accuracy
-            piece_event_key_accuracy = 0
-            piece_event_fullchord_accuracy = 0
-            piece_event_rootchord_accuracy = 0
-            piece_event_fullanalysis_accuracy = 0
-            for ie in range(event_length):
-                if dict_golds[riemen]['key_names'][ie] == pred_key_names[ie]:
-                    piece_event_key_accuracy += 1
-                if dict_golds[riemen]['fullchord_labels'][ie] == pred_fullchord_labels[ie]:
-                    piece_event_fullchord_accuracy += 1
-                if dict_golds[riemen]['rootchord_labels'][ie] == pred_rootchord_labels[ie]:
-                    piece_event_rootchord_accuracy += 1
-                if (dict_golds[riemen]['key_names'][ie] == pred_key_names[ie]) and (dict_golds[riemen]['fullchord_labels'][ie] == pred_fullchord_labels[ie]):
-                    piece_event_fullanalysis_accuracy += 1
+    total_key_accuracy /= float(total_event_length)
+    total_fullchord_accuracy /= float(total_event_length)
+    total_rootchord_accuracy /= float(total_event_length)
+    total_fullanalysis_accuracy /= float(total_event_length)
+    total_rootanaylsis_accuracy /= float(total_event_length)
 
-            total_event_length += event_length
-            total_event_key_accuracy += piece_event_key_accuracy
-            total_event_fullchord_accuracy += piece_event_fullchord_accuracy
-            total_event_rootchord_accuracy += piece_event_rootchord_accuracy
-            total_event_fullanalysis_accuracy += piece_event_fullanalysis_accuracy
-
-            gold_seg_fullanalysis_labels = event_to_segment(riemen, dict_golds[riemen]['fullanalysis_labels'])
-            pred_seg_fullanalysis_labels = event_to_segment(riemen, pred_fullanalysis_labels)
-
-            dict_output[riemen]['eval_metrics'] = {
-                'key_accuracy': piece_event_key_accuracy / float(event_length),
-                'fullchord_accuracy': piece_event_fullchord_accuracy / float(event_length),
-                'rootchord_accuracy': piece_event_rootchord_accuracy / float(event_length),
-                'fullanalysis_accuracy': piece_event_fullanalysis_accuracy / float(event_length),
-            }
-
-            labeled_score = get_labeled_score(
-                riemen,
-                gold=gold_seg_fullanalysis_labels,
-                pred=pred_seg_fullanalysis_labels,
-                offsets=pred_metrics
-            )
-            labeled_score.write('musicxml', str(output_dir / Path('riemenschneider{}-seed{}.mxl'.format(riemen, config.seed))))
-
-            # add gold
-            dict_output[riemen]['gold'] = dict_golds[riemen]
-
-    total_event_key_accuracy /= float(total_event_length)
-    total_event_fullchord_accuracy /= float(total_event_length)
-    total_event_rootchord_accuracy /= float(total_event_length)
-    total_event_fullanalysis_accuracy /= float(total_event_length)
-
-    dict_output['total_eval_metrics'] = {
-        'key_accuracy': total_event_key_accuracy,
-        'fullchord_accuracy': total_event_fullchord_accuracy,
-        'rootchord_accuracy': total_event_rootchord_accuracy,
-        'fullanalysis_accuracy': total_event_fullanalysis_accuracy,
+    accuracy_scores['total'] = {
+        'key_accuracy_micro': total_key_accuracy,
+        'rootchord_accuracy_micro': total_rootchord_accuracy,
+        'rootanalysis_accuracy_micro': total_rootanaylsis_accuracy
     }
-    logger.info('key_accuracy: {}'.format(total_event_key_accuracy))
-    logger.info('fullchord_accuracy: {}'.format(total_event_fullchord_accuracy))
-    logger.info('rootchord_accuracy: {}'.format(total_event_rootchord_accuracy))
-    return dict_output
+    logger.info('--- summary ---')
+    logger.info('num_modes: {}'.format(model.num_modes))
+    logger.info('key_accuracy: {}'.format(total_key_accuracy))
+    logger.info('rootchord_accuracy: {}'.format(total_rootchord_accuracy))
+    logger.info('rootanalysis_accuracy: {}'.format(total_rootanaylsis_accuracy))
+    if config.dataset in ['bach-4part-mxl']:
+        accuracy_scores['total']['fullchord_accuracy_micro'] = total_fullchord_accuracy
+        accuracy_scores['total']['fullanalysis_accuracy_micro'] = total_fullanalysis_accuracy
+        logger.info('fullchord_accuracy: {}'.format(total_fullchord_accuracy))
+        logger.info('fullanalysis_accuracy: {}'.format(total_fullanalysis_accuracy))
+    return accuracy_scores
 
 
 def run(args):
     set_seed(args.seed, args.device)
 
     config = Config(args)
+    if config.dataset == 'bach60':
+        config.dir_dataset = 'bach60'
+    else:
+        config.dir_dataset = None
     assert not (args.do_train and args.do_test)
     assert not (args.do_train and args.make_hsmm_graphs)
 
@@ -782,30 +873,27 @@ def run(args):
         data_dir = config.dir_instance_output
 
     instance_path = data_dir / Path('{}.pkl'.format(config.data_suffix))
-    if 'bach60' in config.dataset:
+    if config.dataset == 'bach60':
         reader = Bach60Reader(config)
-        if instance_path.is_file():
-            instances = pickle.load(instance_path.open('rb'))
-        else:
-            instances = reader.create_instance(logger)
-            pickle.dump(instances, instance_path.open('wb'))
-    elif 'bach-4part' in config.dataset:
-        reader = BachChoraleReader(config)
-        if instance_path.is_file():
-            instances = pickle.load(instance_path.open('rb'))
-        else:
-            instances = reader.create_instance(logger)
-            pickle.dump(instances, instance_path.open('wb'))
     else:
-        raise NotImplementedError
-
-    train_instances, dev_instances, test_instances = reader.split_train_dev_test(instances, logger)
+        reader = MxlReader(config)
+    if instance_path.is_file():
+        instances = pickle.load(instance_path.open('rb'))
+    else:
+        instances = reader.create_instance(logger, config.dir_dataset)
+        pickle.dump(instances, instance_path.open('wb'))
 
     if args.do_train:
+        if config.dataset in ['bach60']:
+            seq_instances = instances
+        else:
+            seq_instances = reader.convert_to_chromaseq(instances, logger)
+        train_instances, dev_instances, _ = reader.split_train_dev_test(seq_instances, logger)
         if config.model_to_initialize is not None:
             pretrained_checkpoint = torch.load(args.model_to_initialize, map_location=torch.device(args.device))
             model = NeuralHSMM(config)
             model.load_state_dict(pretrained_checkpoint['model'], strict=False)
+            model.num_modes = config.num_modes  # overwrite num_modes
         else:
             model = NeuralHSMM(config)
         logger.info('Start training')
@@ -842,6 +930,11 @@ def run(args):
         )
 
     if args.do_test:
+        if config.dataset in ['bach60']:
+            seq_instances = instances
+        else:
+            seq_instances = reader.convert_to_chromaseq(instances, logger)
+        _, _, test_instances = reader.split_train_dev_test(seq_instances, logger)
         instance_label = TEST
         instance_for_test = test_instances
 
@@ -859,11 +952,10 @@ def run(args):
             output_dir.mkdir()
 
         if config.dataset == 'bach60':
-            run_evaluate_bach60(config, model, instance_for_test, logger)
-        elif 'bach-4part-mxl' in config.dataset:
-            run_evaluate_bach_4part(config, model, instance_for_test, logger, output_dir)
+            accuracy_scores = run_evaluate_bach60(config, model, instance_for_test, logger)
         else:
-            raise NotImplementedError
+            assert config.dataset in ['bach-4part-mxl']
+            accuracy_scores = run_evaluate(config, model, model_filename.stem, instance_for_test, logger, output_dir)
 
 
 if __name__ == '__main__':

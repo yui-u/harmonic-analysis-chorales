@@ -27,9 +27,9 @@ class ValueInstance(TensorInstance):
 
 
 class ListInstance(TensorInstance):
-    def __init__(self, list_instances, pad_value=None, fix_padding_length=None):
+    def __init__(self, list_instances, pad_value):
         self.list_instances = list_instances
-        self.fix_padding_length = fix_padding_length
+        self.pad_value = pad_value
 
     def to_tensor(self):
         if isinstance(self.list_instances[0], int) or \
@@ -41,6 +41,24 @@ class ListInstance(TensorInstance):
         else:
             raise NotImplementedError
         return tensor
+
+    def to_padded_tensor(self, pad_length, dim=0):
+        assert dim == 0
+        if len(self.list_instances) < pad_length:
+            len_to_pad = pad_length - len(self.list_instances)
+            tensor = self.to_tensor()
+            pad_size = list(tensor.size())
+            pad_size[0] = len_to_pad
+            pad_size = torch.Size(pad_size)
+            pad_tensor = torch.ones(pad_size) * self.pad_value
+            return torch.cat([
+                tensor,
+                pad_tensor
+            ], dim=0)
+        elif pad_length < len(self.list_instances):
+            return self.to_tensor()[:pad_length]
+        else:
+            return self.to_tensor()
 
     def __len__(self):
         return len(self.list_instances)
